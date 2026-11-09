@@ -1,0 +1,766 @@
+"""Onboarding interview agent: backends, state, profile write-back.
+
+The scripted `claude -p` fake here is the A1 validation artifact: it pins
+the print-mode contract verified live against claude 2.1.197 on 2026-11-04
+(`claude -p --output-format json [--resume SID] PROMPT` -> one JSON envelope
+with result/session_id/is_error; unsigned-in = exit 1 with is_error true)
+and drives the multi-turn state transitions on top of it.
+"""
+
+import json
+import stat
+
+import pytest
+import yaml
+
+from kestrel import config, engine_auth, onboarding
+
+SIGNED_IN = engine_auth.EngineStatus("claude", engine_auth.SIGNED_IN, "claude.ai", "/usr/bin/claude")
+SIGNED_OUT = engine_auth.EngineStatus("claude", engine_auth.SIGNED_OUT, None, "/usr/bin/claude")
+
+FAKE_CLAUDE = r'''#!/usr/bin/env python3
+"""Scripted `claude -p` fake — pins the print-mode contract.
+
+argv:   claude -p --output-format json [--resume SESSION_ID] PROMPT
+stdout: one JSON envelope {type, subtype, is_error, result, session_id}
+Any argv outside that contract is a loud exit-2, so a test that passes
+proves the real argv wiring.
+"""
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+if args[:3] != ["-p", "--output-format", "json"]:
+    sys.stderr.write("unexpected argv: %r\n" % (args,))
+    sys.exit(2)
+rest = args[3:]
+resume = None
+if len(rest) >= 2 and rest[0] == "--resume":
+    resume, rest = rest[1], rest[2:]
+prompt = rest[0] if rest else ""
+
+log = os.environ.get("FAKE_CLAUDE_LOG")
+if log:
+    with open(log, "a") as f:
+        f.write(json.dumps({"resume": resume, "prompt": prompt}) + "\n")
+
+
+def envelope(result, is_error=False):
+    print(json.dumps({
+        "type": "result", "subtype": "success", "is_error": is_error,
+        "result": result, "session_id": "fake-session-1",
+    }))
+
+
+PROFILE_BLOCK = """Here is your profile.
+
+```json
+{"_kestrel_profile": {
+    "personal": {"full_name": "Test Person", "email": "test@example.com"},
+    "work_authorization": {"legally_authorized_to_work": "Yes",
+                           "require_sponsorship": "No"},
+    "availability": {"earliest_start_date": "Immediately"},
+    "compensation": {"salary_expectation": "140000", "salary_currency": "USD"},
+    "experience": {"current_title": "Data Engineer",
+                   "years_of_experience_total": "6",
+                   "target_role": "Data Engineer"},
+    "skills_boundary": {"programming_languages": "Python, SQL"},
+    "resume_facts": {},
+    "eeo_voluntary": {}},
+ "_kestrel_search": {"queries": ["Data Engineer", "Analytics Engineer"],
+                        "location": "Austin, TX", "remote": true}}
+```
+"""
+
+if os.environ.get("FAKE_CLAUDE_MODE") == "sparse_correction":
+    # F-4 journey: the kickoff greets, the next turn emits the full
+    # profile block, and a turn whose prompt carries a spoken correction
+    # gets a sparse block changing that one field and nothing else.
+    if "opened onboarding" in prompt:
+        envelope("Hello! Tell me about your background.")
+    elif "changed my email" in prompt:
+        envelope("Updated!\n```json\n" + json.dumps(
+            {"_kestrel_profile": {"personal": {"email": "new@example.com"}}}) + "\n```")
+    elif "changed my city" in prompt:
+        envelope("Updated!\n```json\n" + json.dumps(
+            {"_kestrel_profile": {"personal": {"city": "Denver, CO"}}}) + "\n```")
+    else:
+        envelope("Thanks! " + PROFILE_BLOCK)
+    sys.exit(0)
+if os.environ.get("FAKE_CLAUDE_MODE") == "unsigned_in":
+    # The real envelope observed live on an unsigned-in CLI (exit 1).
+    envelope("Not logged in · Please run /login", is_error=True)
+    sys.exit(1)
+if os.environ.get("FAKE_CLAUDE_MODE") == "wizard":
+    # Guided-choice acks: one short reply per turn; the fenced-JSON
+    # envelope only when the prompt carries the explicit fallback marker
+    # (answers-driven completion must not depend on the agent emitting it).
+    if "AGENT_JSON_FALLBACK" in prompt:
+        envelope("Understood. " + PROFILE_BLOCK)
+    else:
+        envelope("Noted — thanks!")
+    sys.exit(0)
+if "opened onboarding" in prompt:       # turn 1: kickoff
+    envelope("Hello! Tell me about your background.")
+elif resume == "fake-session-1":        # turn 2+: resumed session
+    envelope("Thanks! " + PROFILE_BLOCK)
+elif resume is not None:                # unknown session id = contract break
+    sys.stderr.write("unknown session: %s\n" % resume)
+    sys.exit(2)
+else:                                   # user turn without --resume = contract break
+    sys.stderr.write("user turn without --resume\n")
+    sys.exit(2)
+'''
+
+
+class FakeLLMClient:
+    """Stand-in for llm.get_client(): records turns, returns a fixed reply."""
+
+    def __init__(self, replies=None):
+        self.replies = list(replies or ["Hello from the provider."])
+        self.calls = []
+
+    def chat(self, messages, **kwargs):
+        self.calls.append([dict(m) for m in messages])
+        return self.replies[min(len(self.calls) - 1, len(self.replies) - 1)]
+
+
+@pytest.fixture()
+def fake_claude(tmp_path, monkeypatch):
+    """Install the scripted fake on a temp PATH and point the backend at it."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "claude"
+    fake.write_text(FAKE_CLAUDE)
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setattr(onboarding, "_claude_binary", lambda: str(fake))
+    return fake
+
+
+@pytest.fixture()
+def signed_in(monkeypatch):
+    monkeypatch.setattr(engine_auth, "claude_status", lambda *a, **k: SIGNED_IN)
+
+
+@pytest.fixture()
+def fake_llm(monkeypatch):
+    """Provider configured + a fake client behind LLMBackend._client."""
+    monkeypatch.setattr(onboarding, "provider_ready", lambda: True)
+    client = FakeLLMClient()
+    monkeypatch.setattr(onboarding.LLMBackend, "_client", lambda self: client)
+    return client
+
+
+# ---------------------------------------------------------------------------
+# A1: the scripted two-turn claude -p exchange (fake pinned to the live contract)
+# ---------------------------------------------------------------------------
+
+def test_a1_two_turn_exchange_drives_state_transitions(
+        app_dir, fake_claude, signed_in, monkeypatch, tmp_path):
+    prompt_log = tmp_path / "prompts.log"
+    monkeypatch.setenv("FAKE_CLAUDE_LOG", str(prompt_log))
+
+    state = onboarding.start_interview("claude")
+    assert state.backend == "claude"
+    assert state.phase == onboarding.INTERVIEW
+    assert state.claude_session_id == "fake-session-1"
+    assert any("background" in m["content"] for m in state.messages
+               if m["role"] == "assistant")
+
+    state = onboarding.send_message(
+        "Data engineer, Austin TX, $140k min, authorized, no sponsorship, remote ok")
+    assert state.phase == onboarding.REVIEW  # draft extracted from turn 2
+    assert state.profile_draft["personal"]["full_name"] == "Test Person"
+
+    profile = onboarding.confirm_profile()
+    assert set(profile) == set(onboarding._PROFILE_KEYS)  # eight-key schema
+    assert profile["personal"]["password"] == ""  # never collected in chat
+    assert onboarding.load_state().phase == onboarding.DONE
+
+    # Contract evidence: turn 1 had no --resume, turn 2 resumed the session.
+    turns = [json.loads(line) for line in prompt_log.read_text().splitlines()]
+    assert turns[0]["resume"] is None
+    assert turns[1]["resume"] == "fake-session-1"
+    assert "opened onboarding" in turns[0]["prompt"]
+
+
+def test_a1_unsigned_in_envelope_falls_back_to_provider(
+        app_dir, fake_claude, signed_in, fake_llm, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "unsigned_in")
+    state = onboarding.start_interview("claude")
+    # Sign-in looked green but print mode failed (the observed exit-1
+    # envelope) — the provider takes over and the user sees a note.
+    assert state.backend == "llm"
+    assert any("continuing with the configured provider" in m["content"]
+               for m in state.messages if m["role"] == "note")
+    assert state.messages[-1]["content"] == "Hello from the provider."
+
+
+def test_a1_mid_interview_fallback_seeds_provider_transcript(
+        app_dir, fake_claude, signed_in, fake_llm, monkeypatch):
+    state = onboarding.start_interview("claude")
+    assert state.backend == "claude"
+    # The CLI vanishes mid-interview (upgrade, PATH change).
+    monkeypatch.setattr(onboarding, "_claude_binary", lambda: None)
+    state = onboarding.send_message("I'm a data engineer from Austin")
+    assert state.backend == "llm"
+    assert state.claude_session_id is None
+    assert state.messages[-1]["content"] == "Hello from the provider."
+    # The rebuilt transcript carries the system prompt + the user's message.
+    first = fake_llm.calls[-1]
+    assert first[0]["role"] == "system"
+    assert any(m["content"] == "I'm a data engineer from Austin" for m in first)
+
+
+# ---------------------------------------------------------------------------
+# Gate and readiness
+# ---------------------------------------------------------------------------
+
+def test_start_refused_until_gate_passes(app_dir, monkeypatch):
+    monkeypatch.setattr(engine_auth, "claude_status", lambda *a, **k: SIGNED_OUT)
+    monkeypatch.setattr(onboarding, "provider_ready", lambda: False)
+    with pytest.raises(onboarding.OnboardingError, match="not signed in"):
+        onboarding.start_interview("claude")
+    with pytest.raises(onboarding.OnboardingError, match="No LLM provider"):
+        onboarding.start_interview("llm")
+
+
+def test_provider_skip_requires_configured_llm(app_dir, monkeypatch):
+    monkeypatch.setattr(engine_auth, "claude_status", lambda *a, **k: SIGNED_OUT)
+    monkeypatch.setattr(onboarding, "provider_ready", lambda: False)
+    with pytest.raises(onboarding.OnboardingError, match="No LLM provider"):
+        onboarding.start_interview("llm")
+
+
+def test_llm_start_seeds_full_message_list(app_dir, fake_llm):
+    state = onboarding.start_interview("llm")
+    assert state.backend == "llm"
+    first_call = fake_llm.calls[0]
+    assert first_call[0]["role"] == "system"
+    assert first_call[0]["content"] == onboarding.SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# State persistence
+# ---------------------------------------------------------------------------
+
+def test_state_roundtrip_survives_restart(app_dir, fake_llm):
+    onboarding.start_interview("llm")
+    onboarding.send_message("six years of data engineering")
+    state = onboarding.load_state()
+    assert state.phase == onboarding.INTERVIEW
+    # The transcript holds only what the user sees: greeting, their reply,
+    # the agent's answer — the system prompt and kickoff prompt are rebuilt
+    # per turn, not stored.
+    roles = [m["role"] for m in state.messages]
+    assert roles == ["assistant", "user", "assistant"]
+    assert state.messages[-2]["content"] == "six years of data engineering"
+    assert state.updated_at  # stamped on save
+
+
+def test_state_file_is_0600(app_dir, fake_llm):
+    onboarding.start_interview("llm")
+    mode = config.ONBOARDING_STATE_PATH.stat().st_mode & 0o777
+    assert mode == 0o600
+
+
+def test_unreadable_state_is_an_error_not_a_fresh_store(app_dir):
+    """Audit F1: a corrupt state file used to masquerade as a fresh
+    store — `agent next` answered 'gate' with exit 0 and a following
+    `start` silently destroyed the interview. load_state now raises; a
+    missing file is still the only fresh-store signal."""
+    config.ONBOARDING_STATE_PATH.write_text("not json{")
+    with pytest.raises(onboarding.OnboardingError, match="corrupt"):
+        onboarding.load_state()
+
+
+# ---------------------------------------------------------------------------
+# Profile draft extraction and normalization
+# ---------------------------------------------------------------------------
+
+def _draft_reply(**profile_overrides):
+    profile = {
+        "personal": {"full_name": "Test Person"},
+        "work_authorization": {"legally_authorized_to_work": True,
+                               "require_sponsorship": "false"},
+        "compensation": {"salary_expectation": "140000"},
+        "experience": {"current_title": "Data Engineer", "target_role": "Data Engineer"},
+    }
+    profile.update(profile_overrides)
+    return ("Confirmed.\n```json\n" + json.dumps({
+        "_kestrel_profile": profile,
+        "_kestrel_search": {"queries": ["Data Engineer"],
+                               "location": "Austin, TX", "remote": True},
+    }) + "\n```")
+
+
+def test_extract_accepts_wrapper_and_bare_blocks():
+    assert onboarding.extract_profile_draft("text\n```json\n" + json.dumps(
+        {"_kestrel_profile": {"personal": {}}, "_kestrel_search": {}}) + "\n```")
+    bare = {"personal": {}, "work_authorization": {}, "compensation": {}}
+    draft = onboarding.extract_profile_draft("```json\n" + json.dumps(bare) + "\n```")
+    assert draft["_kestrel_profile"] == bare  # wrapper-less LLM drift accepted
+    assert onboarding.extract_profile_draft("no block here") is None
+    assert onboarding.extract_profile_draft("```json\n{broken\n```") is None
+
+
+def test_normalize_fills_eight_keys_and_coerces():
+    profile, meta = onboarding.normalize_profile(
+        {"_kestrel_profile": {
+            "personal": {"full_name": "Test Person", "password": "SHOULD_NOT_SURVIVE"},
+            "work_authorization": {"legally_authorized_to_work": True,
+                                   "require_sponsorship": "false"},
+         },
+         "_kestrel_search": {"queries": "Data Engineer, Analytics Engineer",
+                                "location": "Austin, TX", "remote": True}})
+    assert set(profile) == set(onboarding._PROFILE_KEYS)
+    # Wizard field shape inside every section:
+    assert set(profile["personal"]) == {
+        "full_name", "preferred_name", "email", "phone", "city", "province_state",
+        "country", "postal_code", "address", "linkedin_url", "github_url",
+        "portfolio_url", "website_url", "password"}
+    assert profile["personal"]["password"] == ""  # boundary: never from chat
+    assert profile["work_authorization"]["legally_authorized_to_work"] == "Yes"
+    assert profile["work_authorization"]["require_sponsorship"] == "No"
+    assert profile["compensation"]["salary_currency"] == ""  # no silent USD default
+    assert set(profile["eeo_voluntary"].values()) == {"Decline to self-identify"}
+    assert meta["queries"] == ["Data Engineer", "Analytics Engineer"]  # string split
+    assert meta["remote"] is True
+
+
+def test_normalize_profile_leaves_unanswered_auth_blank():
+    """Sweep A S2-1: no recorded answer stays unanswered — never a default."""
+    profile, _ = onboarding.normalize_profile(
+        {"_kestrel_profile": {"work_authorization": {}, "availability": {}},
+         "_kestrel_search": {}})
+    assert profile["work_authorization"]["legally_authorized_to_work"] == ""
+    assert profile["work_authorization"]["require_sponsorship"] == ""
+    assert profile["availability"]["earliest_start_date"] == ""
+
+
+def test_review_flags_unanswered_auth_questions(app_dir, fake_llm):
+    """Sweep A S2-1: the review screen names unanswered gating questions."""
+    profile, _ = onboarding.normalize_profile(
+        {"_kestrel_profile": {"personal": {"full_name": "Test Person",
+                                              "email": "test@example.com"},
+                                  "work_authorization": {}, "availability": {}},
+         "_kestrel_search": {}})
+    missing = onboarding.missing_review_fields(profile)
+    assert "Work authorization (yes/no)" in missing
+    assert "Sponsorship needed (yes/no)" in missing
+    assert "Earliest start date" in missing
+    # Answered profiles are not flagged:
+    answered, _ = onboarding.normalize_profile(
+        {"_kestrel_profile": {"personal": {"full_name": "Test Person",
+                                              "email": "test@example.com"},
+                                  "work_authorization": {"legally_authorized_to_work": True,
+                                                         "require_sponsorship": False},
+                                  "availability": {"earliest_start_date": "March 2027"}},
+         "_kestrel_search": {}})
+    missing_answered = onboarding.missing_review_fields(answered)
+    assert not any("authorization" in m or "Sponsorship" in m or "start date" in m
+                   for m in missing_answered)
+
+
+def test_missing_review_fields_named_for_add_later(app_dir, fake_llm):
+    state = onboarding.start_interview("llm")
+    state.profile_draft = {**onboarding.normalize_profile(
+        {"_kestrel_profile": {}, "_kestrel_search": {}})[0],
+        "_kestrel_search": {}}
+    missing = onboarding.missing_review_fields(state.profile_draft)
+    assert "Full name" in missing and "Email address" in missing
+
+
+# ---------------------------------------------------------------------------
+# Write-back on confirm
+# ---------------------------------------------------------------------------
+
+def test_confirm_writes_all_three_files(app_dir, fake_claude, signed_in):
+    onboarding.start_interview("claude")
+    onboarding.send_message("background and preferences")
+    onboarding.confirm_profile()
+
+    profile = json.loads(config.PROFILE_PATH.read_text())
+    assert set(profile) == set(onboarding._PROFILE_KEYS)
+    assert profile["experience"]["target_role"] == "Data Engineer"
+
+    md = config.PROFILE_MD_PATH.read_text()
+    assert "profile.md" in md and "Test Person" in md and "140000" in md
+
+    searches = yaml.safe_load(config.SEARCH_CONFIG_PATH.read_text())
+    assert searches["defaults"]["location"] == "Austin, TX"
+    assert searches["defaults"]["distance"] == 0  # remote-only
+    assert searches["locations"][0]["remote"] is True
+    assert [q["query"] for q in searches["queries"]] == [
+        "Data Engineer", "Analytics Engineer"]
+    assert [q["tier"] for q in searches["queries"]] == [1, 2]
+
+    # profile data files stay owner-only (S2); searches.yaml follows the wizard.
+    assert config.PROFILE_PATH.stat().st_mode & 0o777 == 0o600
+    assert config.PROFILE_MD_PATH.stat().st_mode & 0o777 == 0o600
+
+
+def test_confirm_preserves_existing_password(app_dir, fake_claude, signed_in):
+    existing = {"personal": {"full_name": "Old", "password": "site-secret"},
+                "work_authorization": {}}
+    config.write_secret_text(config.PROFILE_PATH, json.dumps(existing))
+
+    onboarding.start_interview("claude")
+    onboarding.send_message("background and preferences")
+    profile = onboarding.confirm_profile()
+    # The interview never saw the password — a redo must not wipe it.
+    assert profile["personal"]["password"] == "site-secret"
+    on_disk = json.loads(config.PROFILE_PATH.read_text())
+    assert on_disk["personal"]["password"] == "site-secret"
+
+
+def test_searches_yaml_falls_back_without_remote(app_dir):
+    text = onboarding.render_searches_yaml(
+        {"queries": ["Data Engineer"], "location": "Austin, TX", "remote": False})
+    searches = yaml.safe_load(text)
+    assert searches["defaults"]["distance"] == 25
+    assert searches["locations"][0]["remote"] is False
+
+
+# ---------------------------------------------------------------------------
+# Resume intake
+# ---------------------------------------------------------------------------
+
+def test_resume_paste_feeds_next_agent_turn(app_dir, fake_claude, signed_in,
+                                            monkeypatch, tmp_path):
+    prompt_log = tmp_path / "prompts.log"
+    monkeypatch.setenv("FAKE_CLAUDE_LOG", str(prompt_log))
+    onboarding.start_interview("claude")
+    state = onboarding.add_resume(text="SKILLS Python, SQL", filename="pasted resume")
+    assert config.RESUME_PATH.exists()
+    assert config.RESUME_PATH.stat().st_mode & 0o777 == 0o600
+    assert any("Resume provided" in m["content"] for m in state.messages
+               if m["role"] == "note")
+    onboarding.send_message("that's me")
+    turns = [json.loads(line) for line in prompt_log.read_text().splitlines()]
+    assert "SKILLS Python, SQL" in turns[1]["prompt"]  # injected into turn 2
+    assert "that's me" in turns[1]["prompt"]
+
+
+def test_resume_pdf_upload_is_saved_not_parsed(app_dir, fake_llm):
+    onboarding.start_interview("llm")
+    state = onboarding.add_resume(pdf_bytes=b"%PDF-1.4 fake", filename="me.pdf")
+    assert config.RESUME_PDF_PATH.read_bytes().startswith(b"%PDF")
+    assert config.RESUME_PDF_PATH.stat().st_mode & 0o777 == 0o600
+    assert any("PDF saved" in m["content"] for m in state.messages
+               if m["role"] == "note")
+    assert state.pending_context == ""  # nothing text-shaped to inject
+
+
+def test_resume_rejected_outside_interview(app_dir, fake_llm):
+    with pytest.raises(onboarding.OnboardingError, match="not active"):
+        onboarding.add_resume(text="no interview yet")
+
+
+# ---------------------------------------------------------------------------
+# Grounded agent replies (spec art_ti3XJuNr): question-anchored acks on
+# every backend, pending context scoped to the upload turn
+# ---------------------------------------------------------------------------
+
+def test_ack_prompt_carries_question_options_and_answer():
+    """The grounded prompt names the question's text and id, its offered
+    options, and the submitted value — the agent can never mistake which
+    exchange it is acknowledging."""
+    spec = onboarding.QUESTIONS["work_authorized"]
+    prompt = onboarding.answer_ack_prompt(spec, "No")
+    assert spec.prompt in prompt
+    assert spec.id in prompt
+    assert '"No"' in prompt
+    for option in spec.choices:
+        assert f'"{option.label}"' in prompt
+    # Free-text questions carry no option set to enumerate.
+    bare = onboarding.answer_ack_prompt(onboarding.QUESTIONS["full_name"], "Jane Q. Public")
+    assert "options were" not in bare
+    assert "Jane Q. Public" in bare
+
+
+def test_guided_ack_reaches_both_backends(app_dir, fake_llm):
+    """H1: the provider hears the grounded directive (unrecorded, after the
+    transcript) — the bare choice label in the transcript is not what the
+    agent answers from."""
+    onboarding.start_interview("llm")
+    onboarding.record_answer("full_name", free_text="Jane Q. Public")
+    request = fake_llm.calls[-1]
+    directive = request[-1]
+    assert directive["role"] == "user"
+    assert directive["content"] == onboarding.answer_ack_prompt(
+        onboarding.QUESTIONS["full_name"], "Jane Q. Public")
+    assert "What's your highest" not in directive["content"]  # no other question
+    # The transcript still records only what the user sees.
+    assert any(m["role"] == "user" and m["content"] == "Jane Q. Public" for m in request)
+
+
+def test_claude_backend_ack_carries_the_question(
+        app_dir, fake_claude, signed_in, monkeypatch, tmp_path):
+    """H1 parity: the CLI backend's turn prompt is the same grounded
+    acknowledgement, not a bare label."""
+    prompt_log = tmp_path / "prompts.log"
+    monkeypatch.setenv("FAKE_CLAUDE_LOG", str(prompt_log))
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "wizard")
+    onboarding.start_interview("claude")
+    onboarding.record_answer("full_name", free_text="Jane Q. Public")
+    turns = [json.loads(line) for line in prompt_log.read_text().splitlines()]
+    assert onboarding.answer_ack_prompt(
+        onboarding.QUESTIONS["full_name"], "Jane Q. Public") in turns[1]["prompt"]
+    assert turns[1]["resume"] == "fake-session-1"  # session continuity held
+
+
+def test_claude_backend_session_opening_carries_the_system_prompt(
+        app_dir, fake_claude, signed_in, monkeypatch, tmp_path):
+    """H2: print mode has no system-role channel — the shared SYSTEM_PROMPT
+    rides the session-opening prompt and does not repeat on resumed turns."""
+    prompt_log = tmp_path / "prompts.log"
+    monkeypatch.setenv("FAKE_CLAUDE_LOG", str(prompt_log))
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "wizard")
+    onboarding.start_interview("claude")
+    onboarding.record_answer("full_name", free_text="Jane Q. Public")
+    turns = [json.loads(line) for line in prompt_log.read_text().splitlines()]
+    assert onboarding.SYSTEM_PROMPT in turns[0]["prompt"]
+    assert onboarding.SYSTEM_PROMPT not in turns[1]["prompt"]
+
+
+def test_ack_turn_never_spends_the_pending_resume(app_dir, fake_llm):
+    """H3: pending_context is consumed exactly once, on the
+    question-asking turn that first follows the upload. A draftless turn
+    retains it; an answer ack still delivers it as grounding (a draftless
+    kickoff leaves pure guided mode no other turn that re-offers the
+    resume) but never spends it — ack turns extract nothing."""
+    onboarding.start_interview("llm")
+    onboarding.add_resume(text="MARKER-RESUME-7788")
+    # First turn after the upload: the resume rides the request...
+    onboarding.send_message("I also like hiking")  # draftless: retained
+    assert "MARKER-RESUME-7788" in onboarding.load_state().pending_context
+    assert any("MARKER-RESUME-7788" in m["content"] for m in fake_llm.calls[-1])
+    # ...an answer ack re-delivers it as grounding, but does not spend it.
+    onboarding.record_answer("full_name", free_text="Jane Q. Public")
+    state = onboarding.load_state()
+    assert "MARKER-RESUME-7788" in state.pending_context
+    assert any("MARKER-RESUME-7788" in m["content"] for m in fake_llm.calls[-1])
+    # ...and the next question-asking turn delivers it exactly once: this
+    # one extracts a draft, so the spend sticks.
+    fake_llm.replies = ["Hello from the provider."] * 3 + [_draft_reply()]
+    onboarding.send_message("that's everything")
+    assert onboarding.load_state().pending_context == ""
+    assert any("MARKER-RESUME-7788" in m["content"] for m in fake_llm.calls[-1])
+
+
+# ---------------------------------------------------------------------------
+# Review phase transitions
+# ---------------------------------------------------------------------------
+
+def test_keep_editing_returns_to_interview(app_dir, fake_claude, signed_in):
+    onboarding.start_interview("claude")
+    onboarding.send_message("background and preferences")
+    assert onboarding.load_state().phase == onboarding.REVIEW
+    state = onboarding.keep_editing()
+    assert state.phase == onboarding.INTERVIEW
+    assert state.profile_draft  # kept for context
+
+
+def test_confirm_requires_review_phase(app_dir, fake_llm):
+    onboarding.start_interview("llm")
+    with pytest.raises(onboarding.OnboardingError, match="no profile draft"):
+        onboarding.confirm_profile()
+
+
+def test_redo_clears_state_and_restarts(app_dir, fake_claude, signed_in):
+    onboarding.start_interview("claude")
+    onboarding.send_message("background and preferences")
+    onboarding.confirm_profile()
+    profile_before = config.PROFILE_PATH.read_text()
+
+    state = onboarding.redo_interview()
+    assert state.phase == onboarding.INTERVIEW
+    assert state.backend == "claude"
+    assert state.claude_session_id == "fake-session-1"  # fresh kickoff ran
+    assert config.PROFILE_PATH.read_text() == profile_before  # profile untouched
+
+
+# ---------------------------------------------------------------------------
+# State integrity: band grounding, draft merge, ack stripping, redo guard
+
+
+RICH_DRAFT = {
+    "personal": {"email": "resume@example.com"},
+    "experience": {"current_title": "Staff Engineer", "years_of_experience_total": "6"},
+    "resume_facts": {"preserved_companies": ["Acme Corp"], "real_metrics": ["cut latency 40%"]},
+    "skills_boundary": {"programming_languages": ["Python", "Go"]},
+}
+
+
+def test_record_answer_validates_against_the_rendered_bands(app_dir, fake_llm):
+    """The wizard renders salary bands from the effective answer set
+    (recorded answers over the bridged draft); record_answer and its ack
+    must validate against the same resolved choices. With experience
+    bridged from the resume instead of recorded, the recorded-only map
+    derives a mid-level band table and rejected three of the four
+    rendered buttons (sweep art_kvtM7h6B)."""
+    onboarding.save_state(onboarding.InterviewState(
+        phase=onboarding.INTERVIEW, backend="llm",
+        answers={"full_name": "Jane Q. Public", "education": "Master's",
+                 "work_style": "remote", "country": "United States",
+                 "work_authorized": "yes", "sponsorship": "no",
+                 "permit_type": "Citizen", "currency": "GBP",
+                 "start_date": "Immediately", "target_roles": "Data Engineer"},
+        profile_draft={"experience": {"years_of_experience_total": "6–10"}}))
+    state = onboarding.load_state()
+    rendered = onboarding.resolved_choices(
+        onboarding.QUESTIONS["salary_band"], onboarding.effective_answers(state))
+    assert [c.value for c in rendered] == ["70000", "90000", "110000", "140000"]
+
+    # The button the user clicked records, and the ack names the bands the
+    # surface showed — not the mid-level table the recorded-only map derived.
+    onboarding.record_answer("salary_band", value="110000")
+    ack = fake_llm.calls[-1][-1]["content"]
+    assert "£110k – £140k" in ack
+    assert "£40k – £55k" not in ack
+    assert onboarding.load_state().answers["salary_band"] == "110000"
+
+
+def test_later_sparse_fenced_block_fills_without_erasing(app_dir, fake_llm):
+    """A later fenced-JSON reply merges into the draft the interview
+    holds: new values fill empty fields, never erase extracted ones.
+    The resume's extraction is not re-derivable once the pending context
+    is spent, so a sparser echo (or an injected block) used to wipe the
+    draft wholesale — and with it the point of the resume-first flow
+    (sweep art_kvtM7h6B)."""
+    onboarding.save_state(onboarding.InterviewState(
+        phase=onboarding.INTERVIEW, backend="llm", profile_draft=RICH_DRAFT))
+    fake_llm.replies = [
+        'Sure.\n```json\n{"_kestrel_profile": '
+        '{"compensation": {"salary_expectation": "90000"}}}\n```']
+
+    onboarding.send_message("set my salary to 90000")
+    state = onboarding.load_state()
+    draft = state.profile_draft
+    assert draft["personal"]["email"] == "resume@example.com"  # kept
+    assert draft["experience"]["current_title"] == "Staff Engineer"  # kept
+    assert draft["resume_facts"]["preserved_companies"] == ["Acme Corp"]  # kept
+    assert draft["skills_boundary"]["programming_languages"] == ["Python", "Go"]  # kept
+    assert draft["compensation"]["salary_expectation"] == "90000"  # filled
+    assert state.phase == onboarding.REVIEW  # a chat turn still finishes the flow
+
+
+def test_sparse_correction_updates_the_field_it_carries():
+    """F-4: a later sparse block correcting one field must land in the
+    draft — the merge is per-field correction, not fill-only-empty."""
+    existing = {"personal": {"email": "resume@example.com", "city": "Austin, TX"}}
+    merged, meta = onboarding._merge_extracted_draft(
+        existing, {"personal": {"email": "new@example.com"}}, {})
+    assert merged["personal"]["email"] == "new@example.com"  # corrected, not dropped
+    assert merged["personal"]["city"] == "Austin, TX"  # field the block lacks: kept
+    assert meta == {}  # empty incoming meta adds nothing
+
+
+def test_sparse_correction_keeps_earlier_field_corrections():
+    """F-4 acceptance: a correction touching one question preserves the
+    corrections a previous sparse block recorded for other questions —
+    corrections accumulate per field, they do not replace each other."""
+    corrected = {"personal": {"full_name": "Test Person",
+                              "email": "new@example.com"}}
+    merged, meta = onboarding._merge_extracted_draft(
+        corrected, {"personal": {"city": "Denver, CO"}},
+        {"location": "Denver, CO"})
+    assert merged["personal"]["email"] == "new@example.com"  # earlier correction kept
+    assert merged["personal"]["full_name"] == "Test Person"
+    assert merged["personal"]["city"] == "Denver, CO"  # new correction applied
+    assert meta["location"] == "Denver, CO"
+
+
+def test_sparse_agent_correction_mid_interview(app_dir, fake_claude, signed_in,
+                                               monkeypatch):
+    """F-4 journey: the user corrects a field in chat mid-interview; the
+    agent's sparse fenced block carries the change and it must reach the
+    draft and the prefill bridge — with every other extracted field
+    intact, and with the first correction surviving a second one."""
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "sparse_correction")
+    onboarding.start_interview("claude")  # kickoff: greeting, no block
+    onboarding.send_message("background and preferences")  # full block
+    state = onboarding.load_state()
+    assert state.phase == onboarding.REVIEW
+    assert state.profile_draft["personal"]["email"] == "test@example.com"
+
+    onboarding.keep_editing()  # back mid-interview, draft kept
+    onboarding.send_message("I changed my email to new@example.com")
+    state = onboarding.load_state()
+    assert state.profile_draft["personal"]["email"] == "new@example.com"  # landed
+    assert state.profile_draft["personal"]["full_name"] == "Test Person"  # kept
+    assert state.profile_draft["_kestrel_search"]["location"] == "Austin, TX"
+
+    # A second sparse correction preserves the first.
+    onboarding.keep_editing()
+    onboarding.send_message("I changed my city to Denver, CO")
+    state = onboarding.load_state()
+    assert state.profile_draft["personal"]["email"] == "new@example.com"  # kept
+    assert state.profile_draft["personal"]["city"] == "Denver, CO"  # landed
+
+    # The prefill bridge surfaces both corrections — the questions were
+    # never recorded, so the corrected draft values are what review shows.
+    bridged = onboarding.draft_to_answers(state.profile_draft, state.answers)
+    assert bridged["email"] == "new@example.com"
+    assert bridged["city"] == "Denver, CO"
+
+
+def test_ack_turn_ignores_fenced_blocks(app_dir, fake_llm):
+    """Acknowledgement turns extract nothing: their prompt asks for a
+    two-sentence ack and carries the user's free text verbatim, so a
+    fenced block there is an unprompted — or injected — regeneration
+    (sweep art_kvtM7h6B). The reply stays in the transcript as seen; it
+    just may not touch the draft. The pending resume context survives an
+    ack turn too, staying in play for a document-informed one."""
+    onboarding.save_state(onboarding.InterviewState(
+        phase=onboarding.INTERVIEW, backend="llm",
+        answers={"full_name": "Jane Q. Public"},
+        profile_draft=RICH_DRAFT,
+        pending_context="RESUME TEXT: ..."))
+    fake_llm.replies = [
+        'Noted.\n```json\n{"_kestrel_profile": '
+        '{"compensation": {"salary_expectation": "95000"}}}\n```']
+
+    onboarding.record_answer("education", value="Master's")
+    state = onboarding.load_state()
+    draft = state.profile_draft
+    assert draft["experience"]["current_title"] == "Staff Engineer"  # untouched
+    assert not draft.get("compensation", {}).get("salary_expectation")  # nothing fabricated
+    assert state.phase == onboarding.INTERVIEW  # no review jump either
+    assert state.pending_context == "RESUME TEXT: ..."  # context unspent
+    assert any(m["role"] == "assistant" and "```json" in m["content"]
+               for m in state.messages)  # the transcript keeps the reply as seen
+
+
+def test_parse_claude_turn_survives_braces_inside_strings():
+    """A result echoing a brace (resume text, chat JSON) desynced the
+    brace scan and demoted the whole envelope to raw text. The complete
+    stdout is parsed as JSON first, and the banner fallback tracks string
+    state while scanning (sweep art_W1q8u5XY)."""
+    envelope = json.dumps({"type": "result", "result": "echo } done",
+                           "session_id": "s-9", "is_error": False})
+    assert onboarding.parse_claude_turn(envelope) == ("echo } done", "s-9", False)
+
+    bannered = "booting claude…\n" + envelope
+    assert onboarding.parse_claude_turn(bannered) == ("echo } done", "s-9", False)
+
+    raw = "claude: internal error (no envelope)"
+    assert onboarding.parse_claude_turn(raw) == (raw, None, False)
+
+
+def test_redo_refuses_to_wipe_state_without_a_backend(app_dir, monkeypatch):
+    """redo_interview checks readiness BEFORE clearing (sweep
+    art_W1q8u5XY): with the Claude account signed out and no provider
+    configured, starting over used to wipe the store and then fail — an
+    error over an empty interview with no path forward."""
+    monkeypatch.setattr(engine_auth, "claude_status", lambda *a, **k: SIGNED_OUT)
+    monkeypatch.setattr(onboarding, "provider_ready", lambda: False)
+    onboarding.save_state(onboarding.InterviewState(
+        phase=onboarding.INTERVIEW, backend="claude"))
+
+    with pytest.raises(onboarding.OnboardingError):
+        onboarding.redo_interview()
+    assert onboarding.load_state() is not None  # the state survived
+    assert onboarding.load_state().phase == onboarding.INTERVIEW

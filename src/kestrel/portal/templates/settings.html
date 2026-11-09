@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}Settings · Kestrel Portal{% endblock %}
+
+{% macro field_row(field, model_choices = []) %}
+<div class="field">
+  <label for="f-{{ field.key }}">{{ field.label }}</label>
+  {% if field.is_secret %}
+    <div class="secret-row">
+      <input type="password" id="f-{{ field.key }}" name="{{ field.key }}"
+             value="" placeholder="{{ field.masked or 'not set' }}" autocomplete="off">
+      <span class="dim">{{ 'current: ' ~ field.masked if field.masked else 'not set' }}</span>
+      <label class="check"><input type="checkbox" name="{{ field.key }}__clear" value="1"> clear</label>
+    </div>
+  {% elif field.kind == "choice" %}
+    <select id="f-{{ field.key }}" name="{{ field.key }}">
+      {% for choice in field.choices %}
+      <option value="{{ choice }}" {{ 'selected' if choice == field.masked }}>{{ choice or "(unset)" }}</option>
+      {% endfor %}
+    </select>
+  {% elif field.datalist %}
+    <input type="text" id="f-{{ field.key }}" name="{{ field.key }}" value="{{ field.masked }}"
+           list="dl-{{ field.key }}" autocomplete="off">
+    <datalist id="dl-{{ field.key }}" data-model-list>
+      {% for model_id in model_choices %}
+      <option value="{{ model_id }}"></option>
+      {% endfor %}
+    </datalist>
+  {% else %}
+    <input type="text" id="f-{{ field.key }}" name="{{ field.key }}" value="{{ field.masked }}" autocomplete="off">
+  {% endif %}
+  <p class="hint">{{ field.help }}</p>
+</div>
+{% endmacro %}
+
+{% block content %}
+<div class="page-head">
+  <h1>Settings</h1>
+  <p class="dim">Provider, keys, and auto-apply configuration. Secrets are stored masked on this machine — they never leave it except to your chosen provider.
+     Wondering which of these still needs filling in? Open <a href="/system-check">System check</a>.</p>
+</div>
+
+{% if saved %}<p class="alert success">Settings saved and applied to the running portal — no restart needed.</p>{% endif %}
+{% if error %}<p class="alert error">{{ error }}</p>{% endif %}
+
+<form method="post" action="/settings" class="settings-form">
+  <section class="panel">
+    <h2>LLM provider
+      <button type="button" class="secondary" onclick="refreshModelLists()"
+              title="Re-fetch the model ids from GET {base}/models">Refresh model list</button>
+    </h2>
+    {% for field in fields if field.key.startswith("LLM_") %}
+      {{ field_row(field, model_choices) }}
+    {% endfor %}
+  </section>
+
+  <section class="panel">
+    <h2>Provider keys</h2>
+    {% for field in fields if field.key in ("GEMINI_API_KEY", "OPENAI_API_KEY") %}
+      {{ field_row(field) }}
+    {% endfor %}
+  </section>
+
+  <section class="panel">
+    <h2>Auto-apply</h2>
+    {% for field in fields if field.key in ("CAPSOLVER_API_KEY", "FACTORY_API_KEY", "AUTOAPPLY_MODEL", "AUTOAPPLY_ENGINE") %}
+      {{ field_row(field, model_choices) }}
+    {% endfor %}
+  </section>
+
+  <button type="submit" class="primary">Save settings</button>
+</form>
+
+<script>
+async function refreshModelLists() {
+  const resp = await fetch('/settings/models');
+  if (!resp.ok) return;
+  const data = await resp.json();
+  for (const dl of document.querySelectorAll('datalist[data-model-list]')) {
+    dl.replaceChildren(...(data.models || []).map(id => {
+      const opt = document.createElement('option');
+      opt.value = id;
+      return opt;
+    }));
+  }
+}
+</script>
+{% endblock %}
+

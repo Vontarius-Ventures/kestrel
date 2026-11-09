@@ -1,0 +1,111 @@
+<div class="page-head job-head">
+  <div>
+    <h1>{{ job.title or "(untitled)" }}
+      {% if job.fit_score is not none %}<span class="score-pill {{ 'hot' if job.fit_score >= 8 else 'warm' if job.fit_score >= 6 else 'cool' }}">{{ job.fit_score }}/10</span>{% endif %}
+    </h1>
+    <p class="dim">
+      {{ job.site or "unknown site" }} · {{ job.location or "location unknown" }}
+    </p>
+    <p class="salary-line">{{ job.salary or "Pay not listed" }}</p>
+    <p><a href="{{ job.url }}" rel="noreferrer noopener" target="_blank">{{ job.url }}</a></p>
+    {% if job.application_url and job.application_url != job.url %}
+    <p class="dim">Application URL: {{ job.application_url }}</p>
+    {% endif %}
+  </div>
+</div>
+
+{% include "partials/fit_assessment.html" %}
+
+<section class="panel">
+  <h2>Documents</h2>
+  {% if docs.resume.raw or docs.cover.raw %}
+  <div class="doc-list">
+    {% for label, d in [("Tailored resume", docs.resume), ("Cover letter", docs.cover)] %}
+    {% if d.raw %}
+    <div class="doc-item">
+      <div class="doc-info">
+        <span class="doc-kind">{{ label }}</span>
+        <span class="doc-path">{{ d.raw }}</span>
+      </div>
+      {% if d.exists %}
+      <div class="doc-actions">
+        <a class="button" href="/jobs/preview?url={{ job.url | urlencode }}&amp;doc={{ "resume" if label == "Tailored resume" else "cover" }}">Preview</a>
+        <a class="button secondary-button" href="/jobs/download?url={{ job.url | urlencode }}&amp;doc={{ "resume" if label == "Tailored resume" else "cover" }}">Download .txt</a>
+        {% if d.pdf_exists %}
+        <a class="button secondary-button" href="/jobs/download?url={{ job.url | urlencode }}&amp;doc={{ "resume" if label == "Tailored resume" else "cover" }}&amp;format=pdf">Download PDF</a>
+        {% endif %}
+      </div>
+      {% else %}
+      <span class="badge failed">file missing on disk</span>
+      {% endif %}
+    </div>
+    {% endif %}
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="empty">No documents generated yet. Run the tailor stage, or use Regenerate below.</p>
+  {% endif %}
+  <p><a href="/jobs/versions?url={{ job.url | urlencode }}">Version history</a> — every generated version, with the one uploaded at apply time marked.</p>
+</section>
+
+<section class="panel">
+  <h2>Apply state</h2>
+  <ul class="kv">
+    <li><span>Status</span> <span>{% if job.apply_status %}<span class="badge {{ job.apply_status | lower }}">{{ job.apply_status }}</span>{% else %}—{% endif %}</span></li>
+    <li><span>Applied at</span> <span>{{ job.applied_at or "—" }}</span></li>
+    <li><span>Attempts</span> <span>{{ job.apply_attempts or 0 }}</span></li>
+    <li><span>Last attempted</span> <span>{{ job.last_attempted_at or "—" }}</span></li>
+    {% if job.applied_resume_version_id %}<li><span>Resume uploaded</span> <span>version #{{ job.applied_resume_version_id }}</span></li>{% endif %}
+    {% if job.applied_cover_version_id %}<li><span>Cover letter uploaded</span> <span>version #{{ job.applied_cover_version_id }}</span></li>{% endif %}
+    {% if job.apply_error %}<li><span>Error</span> <span class="error-text">{{ job.apply_error }}</span></li>{% endif %}
+    {% if job.apply_conflict %}<li><span>Conflict</span> <span class="error-text">{{ job.apply_conflict }}</span></li>{% endif %}
+    {% if job.agent_id %}<li><span>Agent</span> <span>{{ job.agent_id }}</span></li>{% endif %}
+  </ul>
+</section>
+
+<section class="panel">
+  <h2>Actions</h2>
+  <div class="mark-actions">
+    <form method="post" action="/jobs/regenerate" class="inline-form">
+      <input type="hidden" name="url" value="{{ job.url }}">
+      <label><input type="checkbox" name="include_cover" value="1"> include cover letter</label>
+      <button type="submit" class="secondary">Regenerate</button>
+    </form>
+  </div>
+  <p class="dim">Regenerate clears tailoring state and re-enqueues this job for the tailor stage on the next run. Existing documents stay on disk and remain in version history.</p>
+  <div class="mark-actions">
+    {% if job.apply_status == "in_progress" %}
+    {# Writer coordination (fix 5): a run owns this job — marks are refused
+       (409) until it records its result, so the buttons are disabled. #}
+    <p class="dim">A run is applying to this job right now — manual marks unlock when it finishes and its result is recorded.</p>
+    <form method="post" action="/jobs/mark" class="inline-form">
+      <input type="hidden" name="url" value="{{ job.url }}">
+      <input type="hidden" name="status" value="applied">
+      <button type="submit" class="success" disabled title="A run owns this job — wait for it to finish">Mark applied</button>
+    </form>
+    <form method="post" action="/jobs/mark" class="inline-form mark-failed">
+      <input type="hidden" name="url" value="{{ job.url }}">
+      <input type="hidden" name="status" value="failed">
+      <input type="text" name="reason" placeholder="failure reason (optional)">
+      <button type="submit" class="danger" disabled title="A run owns this job — wait for it to finish">Mark failed</button>
+    </form>
+    {% else %}
+    <form method="post" action="/jobs/mark" class="inline-form">
+      <input type="hidden" name="url" value="{{ job.url }}">
+      <input type="hidden" name="status" value="applied">
+      <button type="submit" class="success">Mark applied</button>
+    </form>
+    <form method="post" action="/jobs/mark" class="inline-form mark-failed">
+      <input type="hidden" name="url" value="{{ job.url }}">
+      <input type="hidden" name="status" value="failed">
+      <input type="text" name="reason" placeholder="failure reason (optional)">
+      <button type="submit" class="danger">Mark failed</button>
+    </form>
+    {% endif %}
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Description</h2>
+  <pre class="description">{{ (job.full_description or job.description or "No description captured.") }}</pre>
+</section>

@@ -1,0 +1,76 @@
+<div id="engine-gates"
+     {% if polling %}hx-get="/engine/status?t0={{ t0 }}&login={{ 1 if login_started else 0 }}" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}>
+  <section class="panel gate">
+    <h2>Claude Code
+      <span class="badge {{ 'completed' if claude.state == 'signed_in' else 'skipped' if claude.state == 'signed_out' else 'failed' }}">
+        {{ claude.state | replace("_", " ") }}
+      </span>
+    </h2>
+    {% if claude.state == "signed_in" %}
+      <p>Signed in{% if claude.auth_method %} <span class="dim">(method: <code>{{ claude.auth_method }}</code>)</span>{% endif %}.
+         Auto-apply can use this engine.</p>
+    {% elif claude.state == "signed_out" %}
+      <p>Claude Code is installed, but not signed in{% if claude.error %} — <span class="dim">{{ claude.error }}</span>{% endif %}.</p>
+      {% if timed_out %}
+        <p class="alert error">Still not signed in after {{ login_timeout_min }} minutes.
+           Check your browser window for the sign-in tab — it may still be open —
+           then check again here.</p>
+      {% endif %}
+      {% if login_url %}
+        {# Headless path: the spawned CLI printed its OAuth URL — offer it here. #}
+        <p class="alert">No browser window opened? Open
+           <a href="{{ login_url }}" rel="noopener noreferrer">{{ login_url }}</a>
+           to finish signing in — this page picks it up automatically.</p>
+      {% endif %}
+      <div class="gate-actions">
+        {% if login_started and not timed_out %}
+          <span class="dim">Waiting for you to finish in the browser window…</span>
+        {% else %}
+          <form method="post" action="/engine/login" class="inline-form">
+            <button>Sign in with Claude</button>
+          </form>
+        {% endif %}
+        {% if timed_out %}
+          <button class="secondary" hx-get="/engine/status?t0={{ now_ts }}" hx-target="#engine-gates" hx-swap="outerHTML">Check again</button>
+        {% endif %}
+        <a class="button-link secondary" href="/settings">Use my AI provider instead</a>
+      </div>
+    {% else %}
+      <p>Claude Code isn't available on this machine yet — it's the default auto-apply engine.
+         You can still run everything through your own AI provider.</p>
+      <div class="gate-actions">
+        <a class="button-link" href="/settings">Use my AI provider instead</a>
+      </div>
+    {% endif %}
+  </section>
+
+  <section class="panel gate">
+    <h2>Factory Droid
+      <span class="badge {{ 'completed' if droid.state == 'signed_in' else 'skipped' if droid.state == 'signed_out' else 'idle' }}">
+        {{ {'not_installed': 'not installed', 'signed_out': 'key missing', 'signed_in': 'ready'}[droid.state] }}
+      </span>
+    </h2>
+    {% if droid.state == "signed_in" %}
+      <p>Ready — your Factory API key is saved. The Droid engine can auto-apply.</p>
+    {% elif droid.state == "signed_out" %}
+      <p>Droid is installed, but its API key is missing. Droid has no browser sign-in —
+         paste your Factory API key below (generate one from the
+         <a href="https://docs.factory.com/droid-exec/overview" rel="noopener noreferrer">Factory settings page</a>)
+         and this card flips to ready without a restart.</p>
+      <div class="gate-actions">
+        <form method="post" action="/engine/droid-key" class="inline-form">
+          <input type="password" name="factory_key" placeholder="fk-…" autocomplete="off"
+                 aria-label="Factory API key" required>
+          <button>Save key</button>
+        </form>
+        <a class="button-link secondary" href="/settings">Use my AI provider instead</a>
+      </div>
+    {% else %}
+      <p>Droid isn't available on this machine — and that's fine: you only need it if you
+         prefer it over Claude Code. Your own AI provider runs everything in the meantime.</p>
+      <div class="gate-actions">
+        <a class="button-link" href="/settings">Use my AI provider instead</a>
+      </div>
+    {% endif %}
+  </section>
+</div>

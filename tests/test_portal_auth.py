@@ -1,0 +1,192 @@
+"""Portal security tests: token gate, host check, 0600 token file.
+
+Spec D acceptance: every route 401s without the token; the POST /login
+form swaps the submitted token for a cookie; non-localhost Host headers
+are refused (DNS-rebinding defense). Sweep F9 acceptance: the query
+string is not a token source at all, and no access-log line ever
+contains a token value.
+"""
+
+import logging
+import os
+import stat
+
+from kestrel.portal.auth import host_is_allowed
+
+import pytest
+from fastapi.testclient import TestClient
+
+from kestrel.portal import auth as auth_mod
+from kestrel.portal.app import create_app
+
+# Every GET route the portal serves (plus a bogus run id path).
+ROUTES = [
+    "/",
+    "/jobs",
+    "/jobs/table",
+    "/jobs/detail?url=https://x.example/job",
+    "/jobs/preview?url=https://x.example/job&doc=resume",
+    "/jobs/download?url=https://x.example/job&doc=resume",
+    "/jobs/versions?url=https://x.example/job",
+    "/runs",
+    "/runs/deadbeef/log",
+    "/runs/deadbeef/stream",
+    "/runs/deadbeef/logstream",
+    "/settings",
+    "/static/htmx.min.js",
+]
+
+
+@pytest.fixture()
+def anon_client(portal_env):
+    """Unauthenticated client (no token header/cookie)."""
+    client = TestClient(create_app(), base_url="http://127.0.0.1")
+    yield client
+
+
+def test_every_route_401s_without_token(anon_client):
+    for route in ROUTES:
+        r = anon_client.get(route)
+        assert r.status_code == 401, f"{route} returned {r.status_code}"
+
+
+def test_login_with_wrong_token_401(anon_client):
+    r = anon_client.post("/login", data={"token": "wrong-token"})
+    assert r.status_code == 401
+
+
+def test_login_with_correct_token_sets_cookie(anon_client):
+    app = anon_client.app
+    r = anon_client.post("/login", data={"token": app.state.token},
+                         follow_redirects=False)
+    assert r.status_code == 303
+    assert auth_cookie(anon_client)
+
+
+def auth_cookie(client) -> str | None:
+    jar = client.cookies
+    return jar.get("portal_token")
+
+
+def test_query_token_is_not_a_token_source(anon_client, seeded_profile):
+    """F9: a ?token= URL grants nothing and sets no cookie — the token
+    must never ride in a URL (access logs, history, Referer)."""
+    app = anon_client.app
+    r = anon_client.get(f"/?token={app.state.token}", follow_redirects=False)
+    assert r.status_code == 401
+    assert auth_cookie(anon_client) is None
+
+
+def test_access_log_never_contains_token_value(anon_client, seeded_profile, caplog):
+    """F9 acceptance: no access-log line contains a token value —
+    including stale ?token= links, which now 401 but still must not
+    leak the (long-lived) token into uvicorn's access log. TestClient
+    does not run uvicorn, so records are emitted through the
+    uvicorn.access logger exactly as its access formatter would."""
+    app = anon_client.app
+    access_logger = logging.getLogger("uvicorn.access")
+    with caplog.at_level("INFO", logger="uvicorn.access"):
+        access_logger.info('%s - "%s %s HTTP/%s" %d',
+                           "127.0.0.1", "GET", f"/?token={app.state.token}", "1.1", 401)
+        access_logger.info('%s - "%s %s HTTP/%s" %d',
+                           "127.0.0.1", "GET",
+                           f"/jobs?stage=scored&token={app.state.token}&min=5", "1.1", 401)
+        # An authenticated (cookie) request line must also stay clean.
+        access_logger.info('%s - "%s %s HTTP/%s" %d',
+                           "127.0.0.1", "GET", "/?stage=scored", "1.1", 200)
+    logged = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert app.state.token not in logged
+    assert "token=[REDACTED]" in logged
+
+
+def test_redact_token_query_handles_query_and_anchor_params():
+    from kestrel.portal.auth import redact_token_query
+
+    line = '127.0.0.1 - "GET /?token=abc123 HTTP/1.1" 401'
+    assert "abc123" not in redact_token_query(line)
+    assert "token=[REDACTED]" in redact_token_query(line)
+    mid = 'GET /jobs?stage=scored&token=sekret&min=5 HTTP/1.1'
+    assert redact_token_query(mid) == 'GET /jobs?stage=scored&token=[REDACTED]&min=5 HTTP/1.1'
+    # No token parameter: line passes through untouched.
+    assert redact_token_query('GET /settings HTTP/1.1') == 'GET /settings HTTP/1.1'
+
+
+def test_header_token_grants_access(anon_client):
+    r = anon_client.get("/", headers={"x-portal-token": anon_client.app.state.token})
+    assert r.status_code == 200
+
+
+def test_bearer_token_grants_access(anon_client):
+    r = anon_client.get(
+        "/", headers={"authorization": f"Bearer {anon_client.app.state.token}"}
+    )
+    assert r.status_code == 200
+
+
+def test_non_localhost_host_refused(portal_env):
+    app = create_app()
+    client = TestClient(app, base_url="http://127.0.0.1")
+    r = client.get("/", headers={"host": "evil.example.com",
+                                 "x-portal-token": app.state.token})
+    assert r.status_code == 400
+
+
+def test_token_file_created_0600(portal_env):
+    create_app()
+    token_file = portal_env / "portal_token"
+    assert token_file.exists()
+    if os.name == "posix":
+        assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+
+
+def test_token_reused_not_regenerated(portal_env):
+    app1 = create_app()
+    app2 = create_app()
+    assert app1.state.token == app2.state.token
+
+
+# ---------------------------------------------------------------------------
+# P2-4: the deliberate token-check opt-out (APPLIPILOT_PORTAL_DISABLE_AUTH)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "TRUE", "  Yes  "])
+def test_disable_auth_optout_skips_token_check(anon_client, monkeypatch, value):
+    """P2-4: with the opt-out set, an unauthenticated request passes the
+    middleware. The env is read per request, so no app rebuild is needed."""
+    monkeypatch.setenv(auth_mod.AUTH_DISABLE_ENV, value)
+    r = anon_client.get("/")
+    assert r.status_code == 200
+
+
+@pytest.mark.parametrize("value", ["0", "false", "off", "", "junk"])
+def test_disable_auth_non_truthy_keeps_token_check(anon_client, monkeypatch, value):
+    """Anything but the truthy spellings leaves the token check intact."""
+    monkeypatch.setenv(auth_mod.AUTH_DISABLE_ENV, value)
+    r = anon_client.get("/")
+    assert r.status_code == 401
+
+
+def test_disable_auth_never_weakens_host_check(anon_client, monkeypatch):
+    """The pinned invariant: the opt-out relaxes ONLY the token check —
+    a non-localhost Host header is still refused outright. Without this,
+    an opted-out portal behind a widened bind is a LAN-reachable
+    unauthenticated store reader."""
+    monkeypatch.setenv(auth_mod.AUTH_DISABLE_ENV, "1")
+    r = anon_client.get("/", headers={"Host": "evil.example.com"})
+    assert r.status_code == 400
+
+
+
+def test_host_is_allowed_bracketed_ipv6_with_port():
+    """Portal sweep P3-8: bracketed IPv6 with a port ("[::1]:8000") is
+    localhost — the old colon-split kept the whole header and .strip("[]")
+    only removed the leading bracket, so IPv6-localhost was refused."""
+    assert host_is_allowed("[::1]:8000") is True
+    assert host_is_allowed("[::1]") is True
+    assert host_is_allowed("[127.0.0.1]:8000") is True
+    assert host_is_allowed("127.0.0.1:8000") is True
+    assert host_is_allowed("localhost") is True
+    assert host_is_allowed("example.com:8000") is False
+    assert host_is_allowed("[fe80::1]:8000") is False
+    assert host_is_allowed("") is False
+    assert host_is_allowed(None) is False

@@ -1,0 +1,120 @@
+ {# The onboarding surface wrapper: owns the SSE connection. The stream pushes
+   the INNER partial (partials/onboarding_chat.html, no sse attributes) so a
+   push never re-nests the connection. Post routes re-render this wrapper to
+   re-anchor the connection after a state flip. #}
+<div id="onboarding-surface" data-chat-seq="{{ chat_seq }}"
+     hx-ext="sse" sse-connect="/onboarding/stream" sse-swap="chat">
+  {% include "partials/onboarding_chat.html" %}
+</div>
+<script>
+  (function () {
+    // Version-guarded swaps. Every render stamps the state sequence it was
+    // rendered from (data-chat-seq). A push rendered mid-POST — the answer
+    // is saved before the agent ack — can arrive after the POST's own
+    // fresher swap and would replace new content with stale, freezing the
+    // flow mid-question. Drop any push not newer than what the DOM shows:
+    // a same-seq push renders identical state, so skipping it costs nothing
+    // — and it protects in-flight user input (a half-typed free-text field)
+    // from the reconnect's initial-sync re-render, which would otherwise
+    // clobber the form mid-answer and swallow the submitted value.
+    window.__apChatSeq = Math.max(window.__apChatSeq || 0, {{ chat_seq }});
+    if (window.__apChatSeqGuard) return;
+    window.__apChatSeqGuard = true;
+    document.body.addEventListener("htmx:sseBeforeMessage", function (evt) {
+      var data = (evt.detail && evt.detail.data) || "";
+      var m = /data-chat-seq="(\d+)"/.exec(data);
+      if (!m) return;
+      var incoming = parseInt(m[1], 10);
+      if (incoming <= window.__apChatSeq) evt.preventDefault();
+      else window.__apChatSeq = incoming;
+    });
+    document.body.addEventListener("htmx:afterSwap", function (evt) {
+      // POST swaps replace this wrapper (fresh stamp on the wrapper div);
+      // SSE swaps push the inner shell (stamp on the shell div). Either
+      // way, adopt the newer version.
+      var el = evt.detail && evt.detail.target;
+      if (!el || !el.querySelector) return;
+      var shell = el.matches && el.matches("[data-chat-seq]")
+        ? el : el.querySelector("[data-chat-seq]");
+      if (!shell) return;
+      var seq = parseInt(shell.dataset.chatSeq || "0", 10);
+      if (seq > (window.__apChatSeq || 0)) window.__apChatSeq = seq;
+      apBusyGuard(); // a mid-flight SSE push must not unlock the grid
+    });
+
+    // Double-click guard (spec art_ti3XJuNr H5): while an answer request
+    // is in flight, every control on the surface goes dark — a repeat
+    // click must not re-answer, and the data-chat-seq guard above is the
+    // consistency check for anything that still slips through.
+    window.__apBusy = {};
+    window.__apBusySeq = 0;
+    window.apBusyGuard = function () {
+      var surface = document.getElementById("onboarding-surface");
+      if (!surface) return;
+      var now = Date.now();
+      for (var p in window.__apBusy) {
+        if (now - window.__apBusy[p] > 45000) delete window.__apBusy[p];
+      }
+      var busy = Object.keys(window.__apBusy).length > 0;
+      surface.querySelectorAll("button, input, textarea, select").forEach(function (el) {
+        if (busy && !el.disabled) {
+          el.disabled = true;
+          el.setAttribute("data-ap-busy", "");
+        } else if (!busy && el.hasAttribute("data-ap-busy")) {
+          el.disabled = false;
+          el.removeAttribute("data-ap-busy");
+        }
+      });
+    };
+    document.body.addEventListener("htmx:beforeRequest", function (evt) {
+      var surface = document.getElementById("onboarding-surface");
+      if (!surface || !surface.contains(evt.detail.elt)) return;
+      var key = "req:" + (++window.__apBusySeq);
+      window.__apBusy[key] = Date.now();
+      if (evt.detail) evt.detail.__apBusyKey = key;
+      window.apBusyGuard();
+    });
+    // The UNLOCK must NOT ride on htmx:afterRequest. htmx fires that event
+    // on the requesting element AFTER its response's swap has replaced the
+    // surface — the element is detached by then, and an event dispatched
+    // on a detached element never reaches document-level listeners (and
+    // delivery to listeners on the detached element itself proved
+    // unreliable: instrumented runs saw the multi-option form's
+    // afterRequest vanish while the free-text form's arrived). The unlock
+    // therefore hooks the XHR lifecycle: loadend fires on the XHR object
+    // itself — no DOM involvement — on success, failure, and abort alike,
+    // so every settled request releases exactly one entry.
+    var origXhrOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (method, url) {
+      if (String(method).toUpperCase() === "POST"
+          && String(url).indexOf("/onboarding/") !== -1) {
+        this.addEventListener("loadend", function () {
+          var busy = window.__apBusy;
+          var oldest = null;
+          for (var p in busy) {
+            if (oldest === null || busy[p] < busy[oldest]) oldest = p;
+          }
+          if (oldest !== null) delete busy[oldest];
+          window.apBusyGuard();
+        });
+      }
+      return origXhrOpen.apply(this, arguments);
+    };
+    // Active watchdog: purge stale entries on a timer, not only when the
+    // next htmx event happens — a missed unlock must self-heal even on a
+    // surface that sits idle afterwards.
+    setInterval(function () {
+      var surface = document.getElementById("onboarding-surface");
+      if (!surface) return;
+      var now = Date.now();
+      var purged = false;
+      for (var p in window.__apBusy) {
+        if (now - window.__apBusy[p] > 45000) {
+          delete window.__apBusy[p];
+          purged = true;
+        }
+      }
+      if (purged) window.apBusyGuard();
+    }, 5000);
+  })();
+</script>

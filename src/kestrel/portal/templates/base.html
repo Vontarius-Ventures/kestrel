@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en" {% if theme %}data-theme="{{ theme }}"{% endif %}>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Kestrel Portal{% endblock %}</title>
+  <link rel="icon" type="image/png" href="/static/kestrel-mono.png">
+  <link rel="stylesheet" href="/static/portal.css">
+  <script src="/static/htmx.min.js" defer></script>
+  <script src="/static/ext-sse.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="sidebar-brand" href="/" aria-label="Kestrel home">
+        <img class="brand-mark" src="/static/kestrel-mark.png" alt="" width="26" height="26">Kestrel
+      </a>
+      <nav class="side-nav" aria-label="Main">
+        <a href="/jobs" {% if request.url.path.startswith("/jobs") %}class="active" aria-current="page"{% endif %}>Jobs</a>
+        <a href="/" {% if request.url.path == "/" %}class="active" aria-current="page"{% endif %}>Dashboard</a>
+        <a href="/runs" {% if request.url.path.startswith("/runs") %}class="active" aria-current="page"{% endif %}>Runs</a>
+        <a href="/automation" {% if request.url.path.startswith("/automation") %}class="active" aria-current="page"{% endif %}>Automation</a>
+        <a href="/onboarding" {% if request.url.path.startswith("/onboarding") %}class="active" aria-current="page"{% endif %}>Onboarding</a>
+        <a href="/engine" {% if request.url.path.startswith("/engine") %}class="active" aria-current="page"{% endif %}>Agent</a>
+        <a href="/system-check" {% if request.url.path.startswith("/system-check") %}class="active" aria-current="page"{% endif %}>System check</a>
+        <a href="/settings" {% if request.url.path.startswith("/settings") %}class="active" aria-current="page"{% endif %}>Settings</a>
+      </nav>
+      <div class="side-footer">
+        Local portal · your data stays on this machine.
+      </div>
+    </aside>
+    <main class="content">
+      <div class="page-inner">
+        {% block content %}{% endblock %}
+      </div>
+    </main>
+  </div>
+</body>
+</html>

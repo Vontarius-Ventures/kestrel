@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Runs · Kestrel Portal{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Runs</h1>
+  <p class="dim">Everything that has run, newest first. Start work from the <a href="/automation">Automation</a> page.</p>
+</div>
+
+{% if error %}<p class="alert error">{{ error }}</p>{% endif %}
+{% if notice %}<p class="alert info">{{ notice }}</p>{% endif %}
+
+{% if scheduler_skip %}
+<p class="alert warn">Scheduled runs paused — {{ scheduler_skip }} Manual starts from the
+Automation page still work.</p>
+{% endif %}
+
+<section class="panel">
+  <h2>Run history</h2>
+  {% include "partials/runs_table.html" %}
+</section>
+{% endblock %}
