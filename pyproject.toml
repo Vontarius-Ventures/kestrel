@@ -40,7 +40,7 @@ portal = [
     "python-multipart>=0.0.9",
 ]
 # [browser]: the built-in Playwright fallback engine — headless Chromium for
-# page scraping (smart-extract, detail enrichment) and PDF rendering. An
+# page scraping (detail enrichment) and PDF rendering. An
 # agent-driven install doesn't need it: the host agent's own browser covers
 # page fetching. Kept in `dev` so the suite still exercises it.
 browser = ["playwright>=1.40"]

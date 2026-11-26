@@ -63,10 +63,9 @@ and a skipped gate is no gate.
 
 ### Adding Workday employers and career sites
 
-Workday employer portals live in `src/kestrel/config/employers.yaml`; direct
-career sites in `src/kestrel/config/sites.yaml`. Find the portal URL and
-Workday instance/tenant (or the site's CSS selectors for job listings), add
-an entry following the existing format, and verify with
+Workday employer portals live in `src/kestrel/config/employers.yaml`. Find the
+portal URL and Workday instance/tenant, add an entry following the existing
+format, and verify with
 `kestrel run --stage discover` against that employer or site before
 submitting.
 

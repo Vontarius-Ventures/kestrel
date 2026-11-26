@@ -100,11 +100,6 @@ class TestLazySitesRouteThroughGuard:
     extra surfaces as the guided SystemExit — never an ImportError traceback
     and never a module-level hard dependency."""
 
-    def test_smartextract(self):
-        from kestrel.discovery import smartextract
-
-        assert smartextract.sync_playwright is browser.sync_playwright
-
     def test_detail_enrichment(self):
         from kestrel.enrichment import detail
 

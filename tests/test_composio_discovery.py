@@ -585,8 +585,6 @@ def test_discover_stage_degrades_on_composio_error(monkeypatch, clean_composio_e
     monkeypatch.setattr("kestrel.discovery.jobspy.run_discovery", lambda: None)
     monkeypatch.setattr("kestrel.discovery.workday.run_workday_discovery",
                         lambda employers=None, workers=1: None)
-    monkeypatch.setattr("kestrel.discovery.smartextract.run_smart_extract",
-                        lambda workers=1: None)
 
     import kestrel.discovery.composio as composio_module
 

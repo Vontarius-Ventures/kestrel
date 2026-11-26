@@ -874,7 +874,7 @@ def test_ensure_columns_still_raises_other_operational_errors(isolated_db, tmp_p
 
 
 def _discover_stats(**overrides) -> dict:
-    stats = {"jobspy": "ok", "workday": "ok", "smartextract": "ok", "composio": "ok"}
+    stats = {"jobspy": "ok", "workday": "ok", "composio": "ok"}
     stats.update(overrides)
     return stats
 
@@ -896,11 +896,11 @@ def test_f5_streaming_discover_suberrors_surfaced(monkeypatch):
 
 
 def test_f5_streaming_discover_all_sources_down(monkeypatch):
-    """All four scrapers failing is an error, never ok."""
+    """All three sources failing is an error, never ok."""
     def _all_failing(**kwargs):
         return _discover_stats(
             jobspy="error: dns", workday="error: timeout",
-            smartextract="error: nav", composio="error: 1810",
+            composio="error: 1810",
         )
 
     monkeypatch.setitem(pipeline._STAGE_RUNNERS, "discover", _all_failing)
