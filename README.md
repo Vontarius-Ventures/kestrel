@@ -34,7 +34,7 @@ The older routes still work, on top of the same core: **provider-backed mode** (
 
 | Stage | What happens |
 |-------|--------------|
-| **1. Discover** | Scrapes Indeed, LinkedIn, Glassdoor, ZipRecruiter, and Google Jobs, plus Workday employer portals and direct career sites. Optional Composio source for web3.career. Deduplicates by URL. |
+| **1. Discover** | Scrapes Indeed, LinkedIn, Glassdoor, ZipRecruiter, and Google Jobs, plus Workday employer portals (API). Optional Composio source for web3.career. Deduplicates by URL. No browser is launched during discovery. |
 | **2. Enrich** | Fetches the full description for every job: JSON-LD structured data first, CSS selectors next, smart extraction as the fallback tier. On the agent route, your agent's browser does the fetching. |
 | **3. Score** | Every job is rated 1–10 against your resume and preferences — by your driving agent, or by a configured LLM in provider mode. Only jobs above your threshold proceed. |
 | **4. Tailor** | Your resume is reworked per job — reorganized, relevant experience emphasized, keywords incorporated. Your declared resume facts are preserved exactly; a typed fabrication guard refuses anything not in the resume. |
@@ -104,7 +104,7 @@ kestrel portal        # optional: localhost web cockpit at http://127.0.0.1:8765
 
 ### Built-in browser engine (optional fallback)
 
-The `[browser]` extra adds Playwright for Kestrel's own page scraping (smart-extract, detail enrichment) and PDF rendering — useful when no agent browser is around:
+The `[browser]` extra adds Playwright for Kestrel's own page scraping (detail enrichment) and PDF rendering — useful when no agent browser is around:
 
 ```bash
 pip install 'kestrel-agent[browser]'

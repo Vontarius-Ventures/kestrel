@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 def _job_title(job: dict, fallback: str = "untitled") -> str:
     """Return the job title as a non-None string (B12).
 
-    ``title`` is nullable in the schema (smart-extract can emit NULL); every
+    ``title`` is nullable in the schema (older discovery rows can be NULL); every
     slice site must guard against None instead of raising TypeError.
     """
     return job.get("title") or fallback

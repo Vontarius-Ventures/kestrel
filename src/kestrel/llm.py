@@ -17,8 +17,10 @@ Provider resolution order:
 LLM_MODEL env var overrides the model name for any provider.
 """
 
+import json
 import logging
 import os
+import re
 import threading
 import time
 
@@ -725,3 +727,28 @@ def reset_client() -> None:
     with _instance_lock:
         _instance = None
 
+
+# -- LLM response parsing ------------------------------------------------------
+
+def extract_json(text: str) -> dict:
+    """Extract JSON from LLM response, handling think tags and code fences."""
+    if "<think>" in text:
+        after = text.split("</think>")[-1].strip()
+        if after:
+            text = after
+    if "```json" in text:
+        text = text.split("```json")[1].split("```")[0]
+    elif "```" in text:
+        text = text.split("```")[1].split("```")[0]
+    text = text.strip()
+    text = re.sub(r'\\([^"\\\/bfnrtu])', r'\1', text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    while text.endswith("}") or text.endswith("]"):
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            text = text[:-1].rstrip()
+    raise json.JSONDecodeError("Could not parse JSON", text, 0)

@@ -2,7 +2,7 @@
 """Shared location filtering for discovery sources (B11).
 
 Single canonical implementation of the location accept/reject filter used by
-the JobSpy, Workday, and smart-extract paths. Semantics:
+the JobSpy and Workday paths. Semantics:
 
 - Remote-marker tags are stripped and the geographic remainder is filtered
   ("France, Remote" filters on "France"); a location that is only remote

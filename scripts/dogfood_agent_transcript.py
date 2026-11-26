@@ -408,7 +408,7 @@ def main() -> int:
     t.note("- Every protocol verb below is the real CLI in a fresh invocation surface;")
 
     # ---- Stub the discovery/enrichment network seams (stage code stays real).
-    from kestrel.discovery import composio, jobspy, smartextract, workday
+    from kestrel.discovery import composio, jobspy, workday
     from kestrel.enrichment import detail
 
     JOBS = [
@@ -429,7 +429,6 @@ def main() -> int:
 
     mp.setattr(jobspy, "run_discovery", seed_jobspy)
     mp.setattr(workday, "run_workday_discovery", lambda workers=1: None)
-    mp.setattr(smartextract, "run_smart_extract", lambda workers=1: None)
     mp.setattr(composio, "run_composio_discovery", lambda: None)
 
     def fill_descriptions(workers=1, limit=100):

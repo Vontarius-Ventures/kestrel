@@ -501,7 +501,7 @@ def extract_with_llm(page, url: str) -> dict:
         elapsed = time.time() - t0
         log.info("LLM: %d chars in, %.1fs", len(prompt), elapsed)
 
-        from kestrel.discovery.smartextract import extract_json
+        from kestrel.llm import extract_json
         result = extract_json(raw)
         desc = result.get("full_description")
         apply_url = result.get("application_url")

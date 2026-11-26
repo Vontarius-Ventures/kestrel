@@ -104,7 +104,7 @@ def _stub_discovery(monkeypatch):
     others run empty. The seams are the functions pipeline._run_discover
     imports at call time, so the real stage code executes.
     """
-    from kestrel.discovery import composio, jobspy, smartextract, workday
+    from kestrel.discovery import composio, jobspy, workday
 
     def seed_jobspy(results_per_site=None):
         conn = database.get_connection()
@@ -118,7 +118,6 @@ def _stub_discovery(monkeypatch):
 
     monkeypatch.setattr(jobspy, "run_discovery", seed_jobspy)
     monkeypatch.setattr(workday, "run_workday_discovery", lambda workers=1: None)
-    monkeypatch.setattr(smartextract, "run_smart_extract", lambda workers=1: None)
     monkeypatch.setattr(composio, "run_composio_discovery", lambda: None)
 
 
